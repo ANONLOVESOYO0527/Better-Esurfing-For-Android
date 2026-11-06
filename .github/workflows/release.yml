@@ -7,6 +7,12 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing version tag to build and publish (empty = artifacts only)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: write
@@ -17,6 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -27,6 +35,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '13114758'
+          packages: 'platform-tools platforms;android-36 build-tools;35.0.0'
+          log-accepted-android-sdk-licenses: false
 
       # Windows 上提交的 gradlew 可能丢失可执行位，CI 里强制兜底
       - name: Make gradlew executable
@@ -35,9 +47,11 @@ jobs:
       # tag 触发时用 tag 名（去掉 v 前缀）作为版本号；
       # 手动触发时回退读取 build.gradle.kts 中的 versionName
       - name: Determine version
+        env:
+          REQUESTED_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          if [[ "${GITHUB_REF_NAME}" =~ ^v[0-9] ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "${REQUESTED_TAG}" =~ ^v[0-9] ]]; then
+            VERSION="${REQUESTED_TAG#v}"
           else
             VERSION=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/android/app/build.gradle.kts)
           fi
@@ -74,9 +88,10 @@ jobs:
           ls -la "$OUT"
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
           files: |
             ${{ runner.temp }}/release-arts/BetterEsurfing-*.apk
             ${{ runner.temp }}/release-arts/SHA256SUMS.txt
