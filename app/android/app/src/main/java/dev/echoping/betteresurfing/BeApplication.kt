@@ -52,6 +52,7 @@ class BeApplication : Application(), Configuration.Provider {
         super.onCreate()
         // 尽早初始化持久层（密码 Keystore / 偏好）
         Prefs.init(this)
+        dev.echoping.betteresurfing.schedule.ScheduleManager.reschedule(this)
         Privilege.appContext = this
 
         // 桌面图标别名同步（幂等）：安装/恢复后把偏好落到两个 launcher alias 的启用态

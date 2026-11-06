@@ -25,6 +25,7 @@ import dev.echoping.betteresurfing.net.sanitizeSsid
 import dev.echoping.betteresurfing.privilege.Mode
 import dev.echoping.betteresurfing.privilege.Privilege
 import dev.echoping.betteresurfing.store.Prefs
+import dev.echoping.betteresurfing.schedule.ScheduleManager
 import dev.echoping.betteresurfing.ui.AuthStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -42,6 +43,7 @@ class AuthService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var stopping = false
+    private var pendingManualStartIndex: Int? = null
     private lateinit var keepAlive: KeepAliveLease
 
     private fun enqueueEngine(operation: () -> Unit) {
@@ -77,6 +79,8 @@ class AuthService : Service() {
         const val ACTION_LOGIN_NOW = "dev.echoping.be.LOGIN_NOW" // 立即用指定索引账号重登
         const val ACTION_LOGOUT = "dev.echoping.be.LOGOUT"
         const val ACTION_STOP = "dev.echoping.be.STOP"
+        private const val ACTION_AUTO_START = "dev.echoping.be.AUTO_START"
+        private const val ACTION_AUTO_STOP = "dev.echoping.be.AUTO_STOP"
         const val EXTRA_INDEX = "index"
 
         @Volatile var isRunning = false; private set
@@ -88,6 +92,14 @@ class AuthService : Service() {
         fun start(ctx: Context) {
             val i = Intent(ctx, AuthService::class.java).setAction(ACTION_START)
             ctx.startForegroundService(i)
+        }
+
+        fun restore(ctx: Context) {
+            ctx.startForegroundService(Intent(ctx, AuthService::class.java).setAction(ACTION_AUTO_START))
+        }
+
+        fun stopAutomatically(ctx: Context) {
+            if (isRunning) ctx.startService(Intent(ctx, AuthService::class.java).setAction(ACTION_AUTO_STOP))
         }
 
         fun loginNow(ctx: Context, index: Int) {
@@ -119,7 +131,25 @@ class AuthService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val action = intent?.action
+        if (action == ACTION_START || action == ACTION_LOGIN_NOW) {
+            ScheduleManager.manualAction(this, true)
+            if (stopping) {
+                pendingManualStartIndex = intent?.getIntExtra(EXTRA_INDEX, Prefs.activeIndex) ?: Prefs.activeIndex
+                Prefs.persistServiceRunning(true)
+                return START_STICKY
+            }
+        }
+        if (action == ACTION_STOP) {
+            ScheduleManager.manualAction(this, false)
+            pendingManualStartIndex = null
+        }
         if (stopping) return START_NOT_STICKY
+        // Ignore a stale schedule stop after settings or a manual override changed.
+        if (action == ACTION_AUTO_STOP && (!Prefs.schedule.enabled || ScheduleManager.automaticAllowed())) {
+            if (!isRunning) stopSelf(startId)
+            return if (isRunning) START_STICKY else START_NOT_STICKY
+        }
         isRunning = true
         _running.value = true
         startForegroundCompat(buildNotification(Repo.state.value))
@@ -135,32 +165,55 @@ class AuthService : Service() {
                 authWith(intent.getIntExtra(EXTRA_INDEX, Prefs.activeIndex))
             }
             ACTION_LOGOUT -> enqueueEngine { EngineHolder.getOrCreate().logout() }
-            ACTION_STOP -> {
-                stopping = true
-                Prefs.persistServiceRunning(false)
-                updateKeepAlive(false)
-                scope.launch {
-                    // Keep earlier commands ordered, and finish shutdown only after Stop.
-                    val stopped = kotlinx.coroutines.CompletableDeferred<Unit>()
-                    enqueueEngine {
-                        try { EngineHolder.engine?.stop() } finally { stopped.complete(Unit) }
-                    }
-                    stopped.await()
-                    shutdown()
-                }
+            ACTION_STOP, ACTION_AUTO_STOP -> {
+                requestStop()
                 return START_NOT_STICKY
+            }
+            ACTION_AUTO_START -> {
+                if (!ScheduleManager.automaticAllowed()) {
+                    requestStop()
+                    return START_NOT_STICKY
+                }
+                Prefs.persistServiceRunning(true)
+                authWith(Prefs.activeIndex, force = false)
             }
             null -> {
                 // 服务被系统重启（START_STICKY）：有运行记忆才恢复，否则自行退场
                 // （「记住运行状态」关闭时 lastRunning 恒为 false，重启即停）
-                if (!Prefs.lastRunning) {
-                    shutdown()
+                if (!ScheduleManager.automaticAllowed()) {
+                    requestStop()
                     return START_NOT_STICKY
                 }
                 authWith(Prefs.activeIndex, force = false)
             }
         }
         return START_STICKY
+    }
+
+    private fun requestStop() {
+        if (stopping) return
+        stopping = true
+        Prefs.persistServiceRunning(false)
+        updateKeepAlive(false)
+        scope.launch {
+            val stopped = kotlinx.coroutines.CompletableDeferred<Unit>()
+            enqueueEngine {
+                try { EngineHolder.engine?.stop() } finally { stopped.complete(Unit) }
+            }
+            stopped.await()
+            val restart = dev.echoping.betteresurfing.schedule.StopCompletionPolicy.restart(
+                pendingManualStartIndex, Prefs.activeIndex,
+                Prefs.schedule.enabled && ScheduleManager.automaticAllowed(),
+            )
+            pendingManualStartIndex = null
+            if (restart != null) {
+                stopping = false
+                Prefs.persistServiceRunning(true)
+                authWith(restart.index, force = restart.force)
+            } else {
+                shutdown()
+            }
+        }
     }
 
     private fun authWith(index: Int, force: Boolean = true) {
@@ -174,6 +227,8 @@ class AuthService : Service() {
             Repo.onLog(3, "没有可用账号，请先在「账号」页添加")
             return
         }
+        val wifi = NetWatch.state.value
+        if (!force && !Prefs.shouldAuth(wifi.ssid, wifi.bssid, wifi.ssidReadable)) return
         Prefs.setActive(index)
         updateKeepAlive(Prefs.shouldAuth(NetWatch.state.value.ssid, NetWatch.state.value.bssid, NetWatch.state.value.ssidReadable))
         enqueueEngine {
@@ -188,6 +243,10 @@ class AuthService : Service() {
     /** WiFi 状态 → 规则判定（FR-2）。连接判定与 SSID 可读性分离：连着但读不到名时按降级策略 */
     private fun handleWifi(st: WifiState) {
         if (!isRunning || stopping) return
+        if (Prefs.schedule.enabled && !ScheduleManager.automaticAllowed()) {
+            requestStop()
+            return
+        }
         updateKeepAlive(st.connected && Prefs.shouldAuth(st.ssid, st.bssid, st.ssidReadable))
         if (!st.connected) {
             Repo.onLog(1, "未连接无线网络，暂停认证引擎")

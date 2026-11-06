@@ -97,8 +97,8 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        if (Prefs.lastRunning && Prefs.activeAccount() != null && !AuthService.isRunning) {
-            AuthService.start(this)
+        if (dev.echoping.betteresurfing.schedule.ScheduleManager.automaticAllowed() && Prefs.activeAccount() != null && !AuthService.isRunning) {
+            AuthService.restore(this)
         }
     }
 
@@ -107,6 +107,7 @@ class MainActivity : ComponentActivity() {
         dev.echoping.betteresurfing.privilege.Privilege.invalidate()
         // 定位开关/授权/工作模式可能在后台变化：回前台时刷新一次 WiFi 事实
         dev.echoping.betteresurfing.net.NetWatch.refresh()
+        dev.echoping.betteresurfing.schedule.ScheduleManager.reconcile(this)
     }
 
     override fun onStop() {

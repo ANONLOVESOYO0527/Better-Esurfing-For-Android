@@ -18,10 +18,14 @@ class KeepAliveWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(
 
     override suspend fun doWork(): Result {
         Prefs.init(applicationContext)
+        if (Prefs.schedule.enabled) {
+            dev.echoping.betteresurfing.schedule.ScheduleManager.reconcile(applicationContext)
+            return Result.success()
+        }
         if (!Prefs.autoBoot || !Prefs.lastRunning) return Result.success()
         if (AuthService.isRunning) return Result.success()
         // 服务不在且最近确实在跑 → 拉起（系统会按 ROM 后台策略尽力执行）
-        AuthService.start(applicationContext)
+        AuthService.restore(applicationContext)
         Repo.onLog(1, "KeepAliveWorker 拉起服务")
         return Result.success()
     }

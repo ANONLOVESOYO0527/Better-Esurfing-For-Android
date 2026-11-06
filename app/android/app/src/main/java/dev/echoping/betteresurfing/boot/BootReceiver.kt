@@ -17,12 +17,16 @@ class BootReceiver : BroadcastReceiver() {
         if (action != Intent.ACTION_BOOT_COMPLETED && action != Intent.ACTION_LOCKED_BOOT_COMPLETED) return
 
         Prefs.init(context)
+        if (Prefs.schedule.enabled) {
+            dev.echoping.betteresurfing.schedule.ScheduleManager.reconcile(context)
+            return
+        }
         if (!Prefs.autoBoot) return
         if (!Prefs.lastRunning) return
         if (Prefs.activeAccount() == null) return
 
         try {
-            AuthService.start(context)
+            AuthService.restore(context)
         } catch (e: Exception) {
             android.util.Log.w("BootReceiver", "start service failed: ${e.message}")
         }

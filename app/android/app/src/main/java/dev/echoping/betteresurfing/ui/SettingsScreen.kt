@@ -549,6 +549,8 @@ private fun KeepAliveSubPage(onChanged: () -> Unit) {
             )
         )
 
+        ScheduleSettings(onChanged)
+
         SettingsHeader("隐藏后台", Modifier.padding(top = 4.dp))
         GroupedColumn(
             listOf {

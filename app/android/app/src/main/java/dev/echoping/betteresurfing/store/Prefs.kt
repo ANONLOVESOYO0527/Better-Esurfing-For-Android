@@ -156,6 +156,9 @@ object Prefs {
     var heartbeatRetry = 3; private set
     var shieldSec = 30; private set
 
+    @Volatile var schedule = dev.echoping.betteresurfing.schedule.ScheduleConfig(); private set
+    @Volatile var scheduleOverride: dev.echoping.betteresurfing.schedule.ScheduleOverride? = null; private set
+
     // ---- 主题 ----
     var themeMode = "system"; private set       // system | light | dark
     var themePalette = "brand"; private set     // dynamic | brand | teal | violet | orange | pink
@@ -190,6 +193,17 @@ object Prefs {
         themePalette = sp.getString("theme_palette", "brand") ?: "brand"
         themeAmoled = sp.getBoolean("theme_amoled", false)
         iconMonet = sp.getBoolean("icon_monet", true)
+        val dayMask = sp.getInt("schedule_days", 127)
+        schedule = dev.echoping.betteresurfing.schedule.ScheduleConfig(
+            enabled = sp.getBoolean("schedule_enabled", false),
+            startMinutes = sp.getInt("schedule_start", 420),
+            stopMinutes = sp.getInt("schedule_stop", 1380),
+            days = java.time.DayOfWeek.entries.filter { dayMask and (1 shl (it.value - 1)) != 0 }.toSet(),
+        )
+        val until = sp.getLong("schedule_override_until", 0)
+        scheduleOverride = if (until > 0) dev.echoping.betteresurfing.schedule.ScheduleOverride(
+            until, sp.getBoolean("schedule_override_run", false),
+        ) else null
     }
 
     private fun loadAccounts() {
@@ -315,6 +329,22 @@ object Prefs {
     }
 
     // ---- 设置读写 ----
+    fun setSchedule(value: dev.echoping.betteresurfing.schedule.ScheduleConfig) {
+        require(!value.enabled || value.validationError == null)
+        val mask = value.days.fold(0) { bits, day -> bits or (1 shl (day.value - 1)) }
+        sp.edit().putBoolean("schedule_enabled", value.enabled)
+            .putInt("schedule_start", value.startMinutes).putInt("schedule_stop", value.stopMinutes)
+            .putInt("schedule_days", mask).remove("schedule_override_until").remove("schedule_override_run").apply()
+        schedule = value
+        scheduleOverride = null
+    }
+
+    fun setScheduleOverride(value: dev.echoping.betteresurfing.schedule.ScheduleOverride?) {
+        sp.edit().putLong("schedule_override_until", value?.untilMillis ?: 0L)
+            .putBoolean("schedule_override_run", value?.run ?: false).apply()
+        scheduleOverride = value
+    }
+
     fun setWorkMode(v: String) {
         require(v in listOf("standard", "shizuku", "root")) { "bad workMode" }
         workMode = v; sp.edit().putString("work_mode", v).apply()
