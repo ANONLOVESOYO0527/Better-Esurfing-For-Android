@@ -9,6 +9,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.PowerManager
+import android.net.wifi.WifiManager
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import dev.echoping.be.mobile.Mobile
@@ -39,6 +41,33 @@ import kotlinx.coroutines.launch
 class AuthService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var stopping = false
+    private lateinit var keepAlive: KeepAliveLease
+
+    private fun enqueueEngine(operation: () -> Unit) {
+        EngineHolder.enqueue(operation)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun createKeepAlive(): KeepAliveLease {
+        val power = getSystemService(POWER_SERVICE) as PowerManager
+        val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+        val cpuLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:auth-cpu")
+            .apply { setReferenceCounted(false) }
+        val wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "$packageName:auth-wifi")
+            .apply { setReferenceCounted(false) }
+        return KeepAliveLease(
+            { if (!cpuLock.isHeld) cpuLock.acquire() },
+            { if (cpuLock.isHeld) cpuLock.release() },
+            { if (!wifiLock.isHeld) wifiLock.acquire() },
+            { if (wifiLock.isHeld) wifiLock.release() },
+        )
+    }
+
+    private fun updateKeepAlive(eligible: Boolean) {
+        try { keepAlive.update(eligible && Prefs.accountAt(Prefs.activeIndex) != null) }
+        catch (ex: Exception) { Repo.onLog(2, "熄屏保活资源获取或释放失败: ${ex.message}") }
+    }
 
     companion object {
         const val CHANNEL_ID = "auth_status"
@@ -80,6 +109,7 @@ class AuthService : Service() {
     override fun onCreate() {
         super.onCreate()
         Prefs.init(this)
+        keepAlive = createKeepAlive()
         createChannel()
         // 常驻通知跟随引擎状态（只在 onCreate 挂一次，避免每次 onStartCommand 重复收集）
         scope.launch { Repo.state.collect { updateNotification(it) } }
@@ -89,6 +119,7 @@ class AuthService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (stopping) return START_NOT_STICKY
         isRunning = true
         _running.value = true
         startForegroundCompat(buildNotification(Repo.state.value))
@@ -103,10 +134,20 @@ class AuthService : Service() {
                 Prefs.persistServiceRunning(true)
                 authWith(intent.getIntExtra(EXTRA_INDEX, Prefs.activeIndex))
             }
-            ACTION_LOGOUT -> EngineHolder.getOrCreate().logout()
+            ACTION_LOGOUT -> enqueueEngine { EngineHolder.getOrCreate().logout() }
             ACTION_STOP -> {
-                EngineHolder.engine?.stop()
-                shutdown()
+                stopping = true
+                Prefs.persistServiceRunning(false)
+                updateKeepAlive(false)
+                scope.launch {
+                    // Keep earlier commands ordered, and finish shutdown only after Stop.
+                    val stopped = kotlinx.coroutines.CompletableDeferred<Unit>()
+                    enqueueEngine {
+                        try { EngineHolder.engine?.stop() } finally { stopped.complete(Unit) }
+                    }
+                    stopped.await()
+                    shutdown()
+                }
                 return START_NOT_STICKY
             }
             null -> {
@@ -116,13 +157,13 @@ class AuthService : Service() {
                     shutdown()
                     return START_NOT_STICKY
                 }
-                if (Repo.state.value.engineState == 0) authWith(Prefs.activeIndex)
+                authWith(Prefs.activeIndex, force = false)
             }
         }
         return START_STICKY
     }
 
-    private fun authWith(index: Int) {
+    private fun authWith(index: Int, force: Boolean = true) {
         // WiFi 门槛：未连接无线网络时不启动引擎，连接后由 NetWatch 事件自动触发
         if (!NetWatch.isConnectedNow()) {
             Repo.onLog(2, "未连接无线网络，暂不认证；连接 WiFi 后自动开始")
@@ -134,37 +175,34 @@ class AuthService : Service() {
             return
         }
         Prefs.setActive(index)
-        val e = EngineHolder.getOrCreate()
-        EngineHolder.currentAccount = acc
-        try {
-            e.loginNow(EngineHolder.toGo(acc))
-        } catch (ex: Exception) {
-            Repo.onLog(3, "启动认证失败: ${ex.message}")
+        updateKeepAlive(Prefs.shouldAuth(NetWatch.state.value.ssid, NetWatch.state.value.bssid, NetWatch.state.value.ssidReadable))
+        enqueueEngine {
+            val e = EngineHolder.getOrCreate()
+            if (EngineStartPolicy.shouldStart(force, e.isRunning)) {
+                EngineHolder.currentAccount = acc
+                e.loginNow(EngineHolder.toGo(acc))
+            }
         }
     }
 
     /** WiFi 状态 → 规则判定（FR-2）。连接判定与 SSID 可读性分离：连着但读不到名时按降级策略 */
     private fun handleWifi(st: WifiState) {
+        if (!isRunning || stopping) return
+        updateKeepAlive(st.connected && Prefs.shouldAuth(st.ssid, st.bssid, st.ssidReadable))
         if (!st.connected) {
-            if (EngineHolder.engine?.isRunning == true) {
-                Repo.onLog(1, "未连接无线网络，暂停认证引擎")
-                EngineHolder.engine?.stop()
-            }
+            Repo.onLog(1, "未连接无线网络，暂停认证引擎")
+            enqueueEngine { EngineHolder.engine?.stop() }
             return
         }
         val allow = Prefs.shouldAuth(st.ssid, st.bssid, st.ssidReadable)
         Repo.onLog(1, "WiFi 事件 ssid=${sanitizeSsid(st.ssid) ?: "未知"} 触发判定=$allow")
         if (allow) {
-            when (Repo.state.value.engineState) {
-                // 已在线 / 认证流程进行中：避免重复触发重登
-                Mobile.StateOnline, Mobile.StateAuthorizing, Mobile.StateDetecting -> Unit
-                else -> authWith(Prefs.activeIndex)
-            }
+            authWith(Prefs.activeIndex, force = false)
         } else {
             // 黑名单命中或白名单未命中且不允许降级：保持静默（不发任何探测包由引擎停止保证）
             if (Prefs.ruleMode == dev.echoping.betteresurfing.store.RuleMode.BLACKLIST ||
                 !Prefs.ssidFallbackAuth
-            ) EngineHolder.engine?.stop()
+            ) enqueueEngine { EngineHolder.engine?.stop() }
         }
     }
 
@@ -183,6 +221,8 @@ class AuthService : Service() {
     }
 
     private fun shutdown() {
+        stopping = true
+        updateKeepAlive(false)
         Prefs.persistServiceRunning(false)
         isRunning = false
         _running.value = false
@@ -191,6 +231,11 @@ class AuthService : Service() {
     }
 
     override fun onDestroy() {
+        stopping = true
+        isRunning = false
+        _running.value = false
+        updateKeepAlive(false)
+        enqueueEngine { EngineHolder.engine?.stop() }
         scope.cancel()
         super.onDestroy()
     }
@@ -237,6 +282,7 @@ class AuthService : Service() {
 
     @Volatile private var lastNotiKey = ""
     private fun updateNotification(state: UiState) {
+        if (!isRunning || stopping) return
         val p = AuthStatus.presentation(state, isRunning)
         val key = p.label + "|" + p.detail
         if (key == lastNotiKey) return

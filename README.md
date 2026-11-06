@@ -12,12 +12,20 @@
 
 ## 下载安装
 
-从 [GitHub Releases](https://github.com/EchoPing07/Better-Esurfing-For-Android/releases/latest) 下载对应架构的 APK：
+从 [GitHub Releases](https://github.com/BILQL2333/Better-Esurfing-For-Android/releases/latest) 下载对应架构的 APK：
 
 | 包名 | 适用设备 |
 | --- | --- |
 | `BetterEsurfing-v*-arm64-v8a.apk` | 绝大多数智能手机（64 位），**一般选这个** |
 | `BetterEsurfing-v*-armeabi-v7a.apk` | 老 32 位设备 |
+
+## v0.7.1 熄屏保活与自动恢复
+
+- 修复认证请求无响应时按停止导致界面卡顿；停止会取消在途请求，并等待旧引擎退出后才允许重启。
+- 前台认证服务运行且连接允许认证的 WiFi 时，持有 CPU / WiFi 保活锁；断网、停止和服务销毁时释放。熄屏运行会增加耗电。
+- 在线时除协议心跳外定期检查认证门户；确认认证失效后自动重新认证，临时探测失败不会直接清除健康会话。
+- 华为 / 鸿蒙设备建议开启「休眠时始终保持网络连接」，允许本应用自启动、关联启动、后台活动，并在电池优化中选择「不允许优化」。保活锁不能绕过系统强制停止或校园网服务端策略。
+- 未配置正式签名时使用开发签名；与其他签名的旧版可能无法直接覆盖安装，更新前请确认签名兼容并保留自己的账号配置。
 
 ## 快速构建
 
@@ -32,7 +40,7 @@ make apk    # gomobile bind → 分架构签名 release APK → dist/
 ```
 
 - 需要 JDK 17 与 Android SDK（`local.properties` 的 `sdk.dir` 指向 SDK）；
-  Gradle 版本由仓库内 Wrapper 锁定（8.11.1，发行包走腾讯镜像，国内可直接 `./gradlew`）。
+  Gradle 版本由仓库内 Wrapper 锁定（8.11.1，发行包使用 Gradle 官方源并校验 SHA-256）。
 - **签名**：release 默认回退 debug 签名（仅供开发调试）。要出正式签名包，复制
   `app/android/keystore.properties.example` 为同目录 `keystore.properties` 并填入
   自己的 keystore 信息（该文件已被 gitignore；CI 走同名环境变量注入）。

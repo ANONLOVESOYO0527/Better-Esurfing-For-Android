@@ -117,6 +117,18 @@ object Repo {
 
 /** 引擎单例持有者（生命周期由 AuthService 控制） */
 object EngineHolder {
+    // Process-wide ordering also covers service destruction/recreation.
+    private val commands = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
+        Thread(task, "be-engine-commands").apply { isDaemon = true }
+    }
+
+    fun enqueue(operation: () -> Unit) {
+        commands.execute {
+            try { operation() }
+            catch (ex: Exception) { Repo.onLog(3, "引擎操作失败: ${ex.message}") }
+        }
+    }
+
     @Volatile var engine: Engine? = null
         private set
 

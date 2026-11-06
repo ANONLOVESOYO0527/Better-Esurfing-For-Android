@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
@@ -38,7 +39,11 @@ func (e *Engine) postRawHeaders(client *http.Client, rawURL, data string) ([]byt
 }
 
 func (e *Engine) doPostHeaders(client *http.Client, rawURL, data string) (string, http.Header, error) {
-	req, err := http.NewRequest(http.MethodPost, rawURL, strings.NewReader(data))
+	return e.doPostHeadersContext(e.ctx, client, rawURL, data)
+}
+
+func (e *Engine) doPostHeadersContext(ctx context.Context, client *http.Client, rawURL, data string) (string, http.Header, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, strings.NewReader(data))
 	if err != nil {
 		return "", nil, fmt.Errorf("create request: %w", err)
 	}
@@ -273,7 +278,9 @@ func (e *Engine) term() error {
 	if err != nil {
 		return err
 	}
-	_, err = e.postText(e.http, e.termURL, enc)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _, err = e.doPostHeadersContext(ctx, e.http, e.termURL, enc)
 	return err
 }
 

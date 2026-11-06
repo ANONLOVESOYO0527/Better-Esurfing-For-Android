@@ -46,6 +46,7 @@ type Engine struct {
 	detail  string
 	cmdCh   chan command
 	notify  chan struct{}
+	ctx     context.Context
 	cancel  context.CancelFunc
 	done    chan struct{}
 
@@ -95,6 +96,7 @@ func NewEngine(cfg *Config, cb Callback) *Engine {
 	}
 	e := &Engine{
 		cfg:    *cfg,
+		ctx:    context.Background(),
 		cb:     cb,
 		logBuf: newRingBuffer(800),
 		cmdCh:  make(chan command, 16),
@@ -147,6 +149,7 @@ func (e *Engine) Start(acc *Account) error {
 	e.curAcc = acc
 	ctx, cancel := context.WithCancel(context.Background())
 	e.cancel = cancel
+	e.ctx = ctx
 	// 修复闪退（close of closed channel）：done 是一次性 channel，
 	// 上次 loop 退出时已 close；必须换新，否则本次 loop 退出时二次 close 直接 panic。
 	e.done = make(chan struct{})
@@ -193,23 +196,21 @@ func (e *Engine) Logout() {
 	e.submit(command{kind: cmdLogout})
 }
 
-// Stop 优雅停止：若在线先尝试 Term，然后结束内部 goroutine。阻塞至多 5 秒。
+// Stop cancels in-flight work and waits up to five seconds for loop cleanup.
+// A timed-out loop remains started: it must exit before another run may start.
 func (e *Engine) Stop() {
 	e.mu.Lock()
 	if !e.started {
 		e.mu.Unlock()
 		return
 	}
-	e.cancel()
+	cancel, done := e.cancel, e.done
+	cancel()
 	e.mu.Unlock()
-	e.submit(command{kind: cmdStop})
 	select {
-	case <-e.done:
+	case <-done:
 	case <-time.After(5 * time.Second):
 	}
-	e.mu.Lock()
-	e.started = false
-	e.mu.Unlock()
 }
 
 // IsRunning 引擎是否在运行。
@@ -340,7 +341,12 @@ func (e *Engine) keepRetrySec() int {
 
 // loop 主循环：单一 goroutine 拥有全部会话字段；命令驱动 + 定时驱动。
 func (e *Engine) loop(ctx context.Context) {
-	defer close(e.done)
+	defer func() {
+		e.mu.Lock()
+		e.started = false
+		close(e.done)
+		e.mu.Unlock()
+	}()
 	e.refreshIdentity()
 	e.setState(StateDetecting, "启动")
 	e.nextAction = time.Now()
@@ -349,11 +355,19 @@ func (e *Engine) loop(ctx context.Context) {
 	defer tick.Stop()
 
 	for {
+		if ctx.Err() != nil {
+			e.handleLogout(true)
+			e.setStateIfChanged(StateIdle, "已停止")
+			return
+		}
 		// 命令优先处理
 	pending:
 		for {
 			select {
 			case c := <-e.cmdCh:
+				if ctx.Err() != nil {
+					break pending
+				}
 				switch c.kind {
 				case cmdLoginNow:
 					e.handleLoginNow(c.acc)
@@ -381,6 +395,9 @@ func (e *Engine) loop(ctx context.Context) {
 		if e.online {
 			if !now.Before(e.nextBeat) {
 				e.beatPhase()
+			}
+			if e.online && !time.Now().Before(e.nextAction) {
+				e.probeOnline()
 			}
 		} else if !now.Before(e.nextAction) && e.curAcc != nil {
 			e.detectPhase()
@@ -492,6 +509,7 @@ func (e *Engine) detectPhase() {
 // probeOnce 执行一次门户探测（不触发认证）。
 func (e *Engine) probeOnce() portal.ConfigResult {
 	return portal.Detect(e.http, e, portal.Options{
+		Context:   e.ctx,
 		ProbeURLs: e.probeURLs,
 		UserAgent: e.currentUA(),
 		DomainMap: e.domainMap,
@@ -536,6 +554,9 @@ func (e *Engine) authRound() {
 	for e.uaIdx = 0; e.uaIdx < len(e.uaChain); e.uaIdx++ {
 		ua := e.uaChain[e.uaIdx]
 		err := e.authAttempt(ua)
+		if e.ctx.Err() != nil {
+			return
+		}
 		switch {
 		case err == nil:
 			// 链内成功：记忆本 UA，后续 ticket/心跳/term 全程沿用
@@ -544,7 +565,7 @@ func (e *Engine) authRound() {
 			e.loginAt = time.Now()
 			e.nextBeat = e.loginAt.Add(time.Duration(e.keepRetrySec()) * time.Second)
 			e.beatFailCnt = 0
-			e.nextAction = time.Time{} // 在线期间不探测
+			e.nextAction = time.Now().Add(e.detectInterval()) // 在线期间仍检查强制门户
 			e.log(LogInfo, "认证成功 ua=%s keep间隔=%ss", ua, e.keepRetry)
 			e.setState(StateOnline, "已在线 "+maskUser(e.curAcc.Username))
 			return
@@ -614,6 +635,9 @@ func (e *Engine) authAttempt(ua string) error {
 }
 
 func (e *Engine) scheduleAuthFailure(detail string) {
+	if e.ctx.Err() != nil {
+		return
+	}
 	if e.backoff == 0 {
 		e.backoff = 3 * time.Second
 	} else {
@@ -637,6 +661,7 @@ func (e *Engine) beatPhase() {
 		}
 		e.beatFailCnt = 0
 		e.nextBeat = now.Add(time.Duration(e.keepRetrySec()) * time.Second)
+
 		return
 	}
 	e.beatFailCnt++
@@ -654,6 +679,27 @@ func (e *Engine) beatPhase() {
 		e.beatFailCnt = 0
 		e.nextAction = time.Now() // 立即重新探测
 		e.setState(StateDetecting, "连接断开，自动重连中")
+	}
+}
+
+// probeOnline is scheduled independently of server-issued heartbeat intervals.
+// Only a parsed captive portal is evidence of authentication loss.
+func (e *Engine) probeOnline() {
+	if e.ctx.Err() != nil {
+		return
+	}
+	res := e.probeOnce()
+	e.nextAction = time.Now().Add(e.detectInterval())
+	if e.ctx.Err() != nil {
+		return
+	}
+	if res.Status == portal.StatusRequireAuthorization {
+		e.log(LogWarn, "检测到认证已失效，自动重新认证")
+		e.online = false
+		e.sess.free()
+		e.ticket = ""
+		e.nextAction = time.Now()
+		e.setState(StateDetecting, "认证已失效，自动重连中")
 	}
 }
 

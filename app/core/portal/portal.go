@@ -9,6 +9,7 @@
 package portal
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
@@ -100,6 +101,7 @@ type State interface {
 
 // Options 探测配置。
 type Options struct {
+	Context   context.Context   // Optional request cancellation; nil uses Background.
 	ProbeURLs []string          // 探测 URL 列表（依次尝试）
 	UserAgent string            // 本轮认证使用的 UA（门户页形态随 UA 族不同，须与后续握手同源）
 	DomainMap map[string]string // 域名 → 公网 IP 映射（DNS 不通时改写）
@@ -283,7 +285,11 @@ func detectOne(client *http.Client, state State, probeURL string, opt Options) C
 	)
 	exhausted := true // 循环自然耗尽 = JS 跳转环（非页面形态问题）
 	for attempt := 0; attempt < maxRedirects; attempt++ {
-		req, rerr := http.NewRequest(http.MethodGet, current, nil)
+		ctx := opt.Context
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, current, nil)
 		if rerr != nil {
 			return ConfigResult{Status: StatusRequestError}
 		}

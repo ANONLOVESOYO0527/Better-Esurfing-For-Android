@@ -30,6 +30,7 @@ type Server struct {
 	mu            sync.Mutex
 	requireAuth   bool
 	keepFailing   bool
+	keepInterval  int
 	logins        int
 	keeps         int
 	terms         int
@@ -57,11 +58,12 @@ type Server struct {
 // 严格握手——与真实服务端一致：非全零 UUID 的握手 body 被 Error-Code 1 拒绝）。
 func New() *Server {
 	m := &Server{
-		requireAuth: true,
-		algoByUA:    map[string]string{},
-		rejectedUAs: map[string]bool{},
-		unusableUAs: map[string]bool{},
-		strict:      true,
+		requireAuth:  true,
+		keepInterval: 1,
+		algoByUA:     map[string]string{},
+		rejectedUAs:  map[string]bool{},
+		unusableUAs:  map[string]bool{},
+		strict:       true,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/generate_204", m.handleProbe)
@@ -75,6 +77,9 @@ func New() *Server {
 	return m
 }
 
+// SetKeepInterval controls the server-issued heartbeat deadline in integration tests.
+func (m *Server) SetKeepInterval(seconds int) { m.mu.Lock(); m.keepInterval = seconds; m.mu.Unlock() }
+
 // Close 关闭服务器。
 func (m *Server) Close() { m.srv.Close() }
 
@@ -84,10 +89,17 @@ func (m *Server) URL() string { return m.srv.URL }
 // ---- 测试控制面 ----
 
 func (m *Server) SetRequireAuth(v bool) { m.mu.Lock(); m.requireAuth = v; m.mu.Unlock() }
-func (m *Server) SetKeepFailing(v bool) { m.mu.Lock(); m.keepFailing = v; m.mu.Unlock() }
-func (m *Server) Logins() int           { m.mu.Lock(); defer m.mu.Unlock(); return m.logins }
-func (m *Server) Keeps() int            { m.mu.Lock(); defer m.mu.Unlock(); return m.keeps }
-func (m *Server) Terms() int            { m.mu.Lock(); defer m.mu.Unlock(); return m.terms }
+func (m *Server) SetKeepFailing(v bool) {
+	m.mu.Lock()
+	m.keepFailing = v
+	if v {
+		m.requireAuth = true
+	}
+	m.mu.Unlock()
+}
+func (m *Server) Logins() int { m.mu.Lock(); defer m.mu.Unlock(); return m.logins }
+func (m *Server) Keeps() int  { m.mu.Lock(); defer m.mu.Unlock(); return m.keeps }
+func (m *Server) Terms() int  { m.mu.Lock(); defer m.mu.Unlock(); return m.terms }
 func (m *Server) LastUser() (string, string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -285,7 +297,7 @@ func (m *Server) handleTicket(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(c.Encrypt(resp)))
 }
 
-// zsmResponse 构造 ZSM 握手二进制响应：4字节头(byte[3]=keyLen) + key + '$' + 36字节UUID + '\'' + extra。
+// zsmResponse 构造 ZSM 握手二进制响应：4字节头(byte[3]=keyLen) + key + '$' + 36字节UUID + '\” + extra。
 // GUID 取舍：algoByUA[ua] 优先，其次 GUID 池轮换，缺省固定 testAlgoID。
 func (m *Server) zsmResponse(w http.ResponseWriter, ua string) {
 	m.mu.Lock()
@@ -344,7 +356,11 @@ func (m *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		m.lastUser, m.lastPass = user, pass
 	}
 	m.lastAuthXMLUA = xmlUnescape(tagValue(xml, "user-agent"))
+	interval := m.keepInterval
 	bad := pass == "WRONG" || pass == ""
+	if !bad {
+		m.requireAuth = false
+	}
 	m.mu.Unlock()
 
 	var resp string
@@ -353,7 +369,7 @@ func (m *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	} else {
 		base := m.srv.URL
 		resp = fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?><response><resultcode>100</resultcode>`+
-			`<keep-url>%s/keep</keep-url><term-url>%s/term</term-url><keep-retry>1</keep-retry></response>`, base, base)
+			`<keep-url>%s/keep</keep-url><term-url>%s/term</term-url><keep-retry>%d</keep-retry></response>`, base, base, interval)
 	}
 	_, _ = w.Write([]byte(c.Encrypt(resp)))
 }
@@ -386,6 +402,7 @@ func (m *Server) handleKeep(w http.ResponseWriter, r *http.Request) {
 func (m *Server) handleTerm(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	m.terms++
+	m.requireAuth = true
 	m.lastTermUA = r.Header.Get("User-Agent")
 	m.mu.Unlock()
 	w.WriteHeader(http.StatusOK)
